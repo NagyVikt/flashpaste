@@ -63,7 +63,27 @@ fn socket_path() -> PathBuf {
 /// Anything slower and we'd rather fall through to bash than hang the user.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(5);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(10);
-const READ_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long we wait for the daemon's reply.
+///
+/// This used to be 150 ms, which was BELOW the daemon's real image-paste
+/// latency and caused a user-visible double paste. The daemon replies only
+/// after `dispatch_image_paste` finishes (X11 re-claim + `tmux if-shell` +
+/// `select-pane` + `send-keys`), so the reply carries the full dispatch cost.
+/// Measured on this box over one day (55 image pastes, daemon journal
+/// `request received` → `PASTED image`): median 37 ms, p90 242 ms, max 341 ms
+/// — 20% of image pastes were slower than 150 ms. Every one of those timed
+/// out here, was reported as a daemon *error*, and exec'd the bash dispatcher,
+/// which pasted the SAME screenshot a second time ~330 ms after the daemon's
+/// paste. The daemon's `(pane, content)` dedup cannot catch that: the second
+/// paste never goes through the socket.
+///
+/// 2 s is ~6x the observed worst case. Waiting is free: tmux invokes the
+/// trigger through `run-shell -b`, so nothing user-facing blocks on it.
+const READ_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Timeout for the liveness `ping` we send after a read timeout, to tell a
+/// slow-but-working daemon apart from a wedged one. Ping is answered from a
+/// fresh connection task, so it does not queue behind our own paste.
+const PING_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -130,6 +150,13 @@ fn main() -> ! {
     match try_daemon(&paste_args) {
         Ok(DaemonOutcome::Handled) => {
             trigger_log("paste", &pane, "handled", "daemon");
+            std::process::exit(0);
+        }
+        Ok(DaemonOutcome::AcceptedNoReply) => {
+            // Slow daemon, still alive: it owns the paste. Exiting 0 also
+            // stops tmux's `trigger || bash-dispatch` shell fallback from
+            // firing the second paste behind our back.
+            trigger_log("paste", &pane, "handled", "daemon-slow-no-reply");
             std::process::exit(0);
         }
         Ok(DaemonOutcome::FallbackRequested) => {
@@ -203,6 +230,13 @@ enum DaemonOutcome {
     Handled,
     /// Daemon explicitly told us to fall back (e.g. no staged image, text paste).
     FallbackRequested,
+    /// The request was written to a daemon that is still alive, but the reply
+    /// did not arrive inside `READ_TIMEOUT`. The daemon OWNS this paste — it
+    /// has the request and its dispatch is what we are waiting on. Running the
+    /// bash dispatcher here would paste the same content a second time, which
+    /// is exactly the double-paste bug (the daemon's `(pane, content)` dedup
+    /// is blind to a paste that never crosses the socket). So: no fallback.
+    AcceptedNoReply,
 }
 
 fn try_daemon(args: &PasteArgs) -> Result<DaemonOutcome> {
@@ -236,15 +270,28 @@ fn try_daemon(args: &PasteArgs) -> Result<DaemonOutcome> {
     // Half-close write side so the daemon can detect EOF if it wants.
     // (Optional; the daemon also honors the length prefix.)
 
+    // From here on the daemon HAS our request. A read failure must not be
+    // treated as "nothing happened": if the daemon is merely slow, it is
+    // already pasting, and a bash fallback would double it.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
+    if let Err(e) = stream.read_exact(&mut len_buf) {
+        if is_timeout(&e) && daemon_is_alive() {
+            return Ok(DaemonOutcome::AcceptedNoReply);
+        }
+        return Err(anyhow::Error::new(e).context("read response length"));
+    }
     let resp_len = u32::from_le_bytes(len_buf) as usize;
     // Bound the response so a wedged daemon can't make us allocate gigabytes.
     if resp_len > 64 * 1024 {
         anyhow::bail!("daemon response too large: {resp_len} bytes");
     }
     let mut resp_buf = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_buf)?;
+    if let Err(e) = stream.read_exact(&mut resp_buf) {
+        if is_timeout(&e) && daemon_is_alive() {
+            return Ok(DaemonOutcome::AcceptedNoReply);
+        }
+        return Err(anyhow::Error::new(e).context("read response body"));
+    }
     let resp: Value = serde_json::from_slice(&resp_buf)?;
 
     let ok = resp.get("ok").and_then(Value::as_bool).unwrap_or(false);
@@ -254,6 +301,56 @@ fn try_daemon(args: &PasteArgs) -> Result<DaemonOutcome> {
 
     // Daemon politely declined — fall through to bash.
     Ok(DaemonOutcome::FallbackRequested)
+}
+
+/// True when `e` is a socket read/write timeout. `SO_RCVTIMEO` surfaces as
+/// `EAGAIN`/`EWOULDBLOCK` on Linux; other platforms use `TimedOut`.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Liveness probe: is the daemon still answering, or is it wedged?
+///
+/// Called only after our paste request timed out, to decide between "slow
+/// daemon, it owns the paste, do nothing" and "dead daemon, bash must paste".
+/// The daemon spawns a task per connection, so this ping does not queue
+/// behind the slow paste we are still waiting on.
+fn daemon_is_alive() -> bool {
+    let path = socket_path();
+    let Ok(mut stream) = UnixStream::connect(&path) else {
+        return false;
+    };
+    stream.set_write_timeout(Some(PING_TIMEOUT)).ok();
+    stream.set_read_timeout(Some(PING_TIMEOUT)).ok();
+
+    let Ok(body) = serde_json::to_vec(&json!({ "op": "ping" })) else {
+        return false;
+    };
+    let Ok(len) = u32::try_from(body.len()) else {
+        return false;
+    };
+    if stream.write_all(&len.to_le_bytes()).is_err() || stream.write_all(&body).is_err() {
+        return false;
+    }
+    let mut len_buf = [0u8; 4];
+    if stream.read_exact(&mut len_buf).is_err() {
+        return false;
+    }
+    let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len > 64 * 1024 {
+        return false;
+    }
+    let mut resp_buf = vec![0u8; resp_len];
+    if stream.read_exact(&mut resp_buf).is_err() {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&resp_buf)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// v1.19+: stage stdin as a text selection in the daemon. Returns the

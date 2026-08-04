@@ -17,6 +17,28 @@ map ctrl+v       launch --type=background --copy-env -- sh -c 'helper=$(flashpas
 # or when debugging xclip ownership.
 map ctrl+alt+v   launch --type=background --copy-env -- sh -c 'helper=$(flashpaste paths --paste-image 2>/dev/null || printf %s "$HOME/paste_image.sh"); exec "$helper" image'
 
+# ── Copying text OUT of a mouse-grabbing TUI (Claude Code, Codex, vim) ──
+# flashpaste's tmux snippet sets `mouse on` (needed for the right-click
+# Paste menu + scroll). Side effect: inside an app that grabs the mouse, a
+# PLAIN drag is handed to the app, so it never produces a terminal
+# selection and Ctrl+Shift+C finds nothing to copy. The escape hatch is
+# SHIFT: hold Shift while dragging and kitty does its own selection,
+# bypassing both tmux and the app. copy_on_select then drops that selection
+# straight onto the system clipboard — no extra keystroke.
+#
+#   To copy code/output from the Claude Code chat: hold SHIFT, drag, release.
+#
+# copy_on_select only fires on these Shift-bypass selections; a plain drag
+# in a normal shell pane still goes to tmux, so this changes nothing there.
+copy_on_select clipboard
+# Pin Shift+drag selection for `grabbed` panes too (mirrors kitty's built-in
+# maps) so it reliably highlights even while an app owns the mouse.
+mouse_map shift+left press       grabbed,ungrabbed mouse_selection normal
+mouse_map shift+left doublepress grabbed,ungrabbed mouse_selection word
+mouse_map shift+left triplepress grabbed,ungrabbed mouse_selection line
+mouse_map shift+left move        grabbed,ungrabbed mouse_selection normal
+mouse_map shift+left release     grabbed,ungrabbed mouse_selection normal
+
 # Optional: bind PrtScr to GNOME's screenshot UI (file lands in
 # ~/Pictures/Screenshots/ — flashpaste's auto-pickup grabs it).
 map ctrl+shift+alt+s launch --type=background sh -c \

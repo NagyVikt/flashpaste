@@ -227,6 +227,13 @@ fn sanitize_clipboard_text(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         return std::borrow::Cow::Borrowed(bytes);
     }
     let out = html_to_plaintext(text);
+    // Safety net: if stripping tags produced nothing but whitespace, the input
+    // was not prose-bearing HTML (it was markup-shaped data — XML/code/config
+    // whose payload lives inside the tags/attributes). Pasting an empty string
+    // is the worst outcome, so keep the original bytes untouched.
+    if out.trim().is_empty() && !text.trim().is_empty() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
     if out.as_bytes() == bytes {
         std::borrow::Cow::Borrowed(bytes)
     } else {
@@ -234,13 +241,100 @@ fn sanitize_clipboard_text(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     }
 }
 
-/// Returns true when `text` contains at least one HTML-ish tag opener:
-/// `<letter…` or `</`. A bare `<` followed by whitespace or a digit
-/// (e.g. `x < 5`, `i < len`) does not count.
+/// Returns true only when `text` carries genuine HTML markup that should be
+/// flattened to plain text (i.e. content copied from a rendered web page).
+///
+/// The old test — any `<` followed by a letter or `/` — was far too broad: it
+/// fired on XML, source code, and config files that merely contain tag-shaped
+/// syntax. A URDF (`<robot>`, `<xacro:property/>`, `<link>`) is almost
+/// entirely such tags, so it was classified as HTML and `html_to_plaintext`
+/// stripped it to nothing — the "copied file pastes empty" bug. We now require
+/// a recognised HTML element (matched with a tag boundary so `<li>` does not
+/// fire on `<link>`, nor `<b>` on `<box>`), an HTML closing tag, an HTML
+/// entity, or a doctype. When unsure, treat it as plain text and leave it
+/// untouched — losing a bit of HTML cleanup is far better than destroying a
+/// user's code/XML paste.
 fn looks_like_html(text: &str) -> bool {
-    let b = text.as_bytes();
-    b.windows(2)
-        .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || w[1] == b'/'))
+    let lower = text.to_ascii_lowercase();
+
+    // Entities only occur in HTML.
+    const ENTITIES: &[&str] = &[
+        "&nbsp;", "&amp;", "&lt;", "&gt;", "&quot;", "&copy;", "&euro;", "&#",
+    ];
+    if ENTITIES.iter().any(|e| lower.contains(e)) {
+        return true;
+    }
+    if lower.contains("<!doctype html") {
+        return true;
+    }
+
+    // Recognised HTML element names. Matched as `<name`/`</name` with a tag
+    // boundary after the name so an XML element that merely shares a prefix
+    // (e.g. `<link>`, `<box>`, `<parent>`) does not register.
+    const TAGS: &[&str] = &[
+        "html",
+        "head",
+        "body",
+        "div",
+        "span",
+        "p",
+        "br",
+        "hr",
+        "a",
+        "img",
+        "ul",
+        "ol",
+        "li",
+        "table",
+        "thead",
+        "tbody",
+        "tr",
+        "td",
+        "th",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "b",
+        "i",
+        "u",
+        "em",
+        "strong",
+        "small",
+        "pre",
+        "code",
+        "blockquote",
+        "font",
+        "style",
+        "script",
+        "button",
+        "label",
+        "nav",
+        "header",
+        "footer",
+        "section",
+        "article",
+    ];
+    let bytes = lower.as_bytes();
+    TAGS.iter()
+        .any(|tag| has_tag_open(bytes, tag, false) || has_tag_open(bytes, tag, true))
+}
+
+/// True when `haystack` contains `<name` (or `</name` when `closing`) followed
+/// by a tag-boundary byte. The boundary check is what prevents `li` matching
+/// `<link>` or `b` matching `<box>`.
+fn has_tag_open(haystack: &[u8], name: &str, closing: bool) -> bool {
+    let needle = if closing {
+        format!("</{name}")
+    } else {
+        format!("<{name}")
+    };
+    let nb = needle.as_bytes();
+    haystack.windows(nb.len() + 1).any(|w| {
+        &w[..nb.len()] == nb && matches!(w[nb.len()], b' ' | b'>' | b'/' | b'\n' | b'\r' | b'\t')
+    })
 }
 
 /// Convert HTML to plain text:
@@ -399,6 +493,51 @@ mod tests {
     #[test]
     fn non_utf8_bytes_passed_through() {
         let input: &[u8] = &[0xff, 0xfe, b'<', b'i', b'm', b'g'];
+        let out = sanitize_clipboard_text(input);
+        assert_eq!(out.as_ref(), input);
+    }
+
+    #[test]
+    fn urdf_xml_not_treated_as_html() {
+        // Regression: a URDF is almost entirely tags whose payload lives in
+        // attributes. The old `<`+letter test classified it as HTML and
+        // stripped it to nothing. It must now pass through byte-for-byte.
+        let input = br#"<?xml version="1.0" encoding="utf-8"?>
+<robot name="atirobot" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:property name="base_width" value="0.45"/>
+  <link name="base_link"/>
+  <joint name="base_to_wheel" type="continuous"/>
+</robot>"#;
+        let out = sanitize_clipboard_text(input);
+        assert_eq!(out.as_ref(), input, "URDF/XML must not be HTML-stripped");
+    }
+
+    #[test]
+    fn cyclonedds_config_xml_not_treated_as_html() {
+        let input = br#"<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General><AllowMulticast>false</AllowMulticast></General>
+  </Domain>
+</CycloneDDS>"#;
+        let out = sanitize_clipboard_text(input);
+        assert_eq!(out.as_ref(), input);
+    }
+
+    #[test]
+    fn html_sharing_a_prefix_with_xml_still_detected() {
+        // `<link>` (XML) must not trigger, but real `<li>`/`<div>` must.
+        assert!(!looks_like_html("<link name=\"base\"/>"));
+        assert!(!looks_like_html("<box size=\"1 2 3\"/>"));
+        assert!(!looks_like_html("<parent link=\"a\"/>"));
+        assert!(looks_like_html("<ul><li>one</li><li>two</li></ul>"));
+        assert!(looks_like_html("<div>hi</div>"));
+    }
+
+    #[test]
+    fn all_tag_html_does_not_strip_to_empty() {
+        // Even if something all-tags slips past looks_like_html, the safety
+        // net keeps the original rather than pasting an empty string.
+        let input = b"<custom:thing a=\"1\"/><custom:thing b=\"2\"/>";
         let out = sanitize_clipboard_text(input);
         assert_eq!(out.as_ref(), input);
     }

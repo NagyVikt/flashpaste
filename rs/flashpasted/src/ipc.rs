@@ -38,7 +38,9 @@ use crate::state::{now_unix_ms, SharedState, StagedImage, StagedSelection, Stage
 /// larger should hit the daemon via a path field, not inline.
 const MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
 /// How long a paste with an identical `(pane, content)` signature is
-/// suppressed after one is accepted. Sized to swallow the dual-handler
+/// suppressed after the last trigger carrying that signature — accepted or
+/// absorbed (see `dedup_decide`; the window slides). Sized to swallow the
+/// dual-handler
 /// spread: kitty's `map ctrl+v` launches the paste router as a BACKGROUND
 /// process, so its redundant fire can land well after tmux's `bind -n C-v`
 /// already pasted — a real measurement on this box showed the two pastes
@@ -49,6 +51,23 @@ const MAX_REQUEST_BYTES: u32 = 8 * 1024 * 1024;
 /// different paste — only a verbatim re-fire of the same bytes into the same
 /// pane within ~2.5 s, which is exactly the bug.
 const PASTE_DEDUP_WINDOW_MS: u64 = 2500;
+/// Same guard, but for IMAGE pastes, where the window has to be wider.
+///
+/// Two reasons the text window is too tight here. An image dispatch takes
+/// ~450 ms end-to-end (X11 re-claim + tmux fork + the agent's own clipboard
+/// read) against ~3 ms for text, so there is far more dead time in which the
+/// paste "feels stuck" and the user presses again. And a re-press is spaced by
+/// human reaction, not by machine latency: a replay of the measured burst on
+/// this box landed its second press 2.54 s after the first — 40 ms past the
+/// text window — and pasted the same screenshot twice even with the window
+/// sliding. 5 s covers a mash at human cadence.
+///
+/// Safe to widen because the guard is keyed on `(pane, content)`: only a
+/// verbatim re-fire of the SAME image into the SAME pane is suppressed.
+/// Deliberately attaching one screenshot twice still works — it just needs
+/// 5 s of quiet, which is far cheaper than silently double-attaching a 250 KB
+/// image to a chat prompt and paying for it twice.
+const PASTE_DEDUP_WINDOW_IMAGE_MS: u64 = 5000;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -205,7 +224,11 @@ async fn handle_paste(state: &Arc<SharedState>, pane: &str, started: Instant) ->
 
     match staged {
         Some(StagedSelection::Text(text)) => {
-            if !claim_paste_slot(state, paste_signature(pane, &text.bytes)) {
+            if !claim_paste_slot(
+                state,
+                paste_signature(pane, &text.bytes),
+                PASTE_DEDUP_WINDOW_MS,
+            ) {
                 return deduped_response(pane, started);
             }
             let bytes = text.bytes.len();
@@ -222,7 +245,11 @@ async fn handle_paste(state: &Arc<SharedState>, pane: &str, started: Instant) ->
             })
         }
         Some(StagedSelection::Image(img)) if img.is_fresh() => {
-            if !claim_paste_slot(state, paste_signature(pane, &img.bytes)) {
+            if !claim_paste_slot(
+                state,
+                paste_signature(pane, &img.bytes),
+                PASTE_DEDUP_WINDOW_IMAGE_MS,
+            ) {
                 return deduped_response(pane, started);
             }
             if let Err(e) = paste::dispatch_image_paste(state.clone(), pane.to_string(), img).await
@@ -375,11 +402,14 @@ async fn eager_live_image_pickup(state: &Arc<SharedState>, pane: &str) {
 async fn resolve_paste_intent(state: &Arc<SharedState>, pane: &str) -> Option<StagedSelection> {
     let mut staged = state.staged_snapshot().await;
     if !matches!(&staged, Some(s) if s.is_fresh()) {
-        let external_text = if should_probe_external_text(state) {
-            read_clipboard_text_if_present().await
-        } else {
-            None
-        };
+        // Always read the live clipboard — never gate this behind the probe
+        // throttle. On Mutter the Wayland read is wedged, so this X11 (xclip)
+        // read is the ONLY way to notice the user copied fresh text since the
+        // daemon last staged. A throttled skip here pastes stale/empty content
+        // instead (the "URDF copy pastes empty" bug). xclip is ~10ms and
+        // dock-flash-free; double-paste is guarded separately by the
+        // content-hash dedup, not by this throttle.
+        let external_text = read_clipboard_text_if_present().await;
         if let Some(bytes) = external_text {
             let s = StagedText {
                 bytes: Arc::new(bytes),
@@ -432,7 +462,7 @@ async fn resolve_paste_intent(state: &Arc<SharedState>, pane: &str) -> Option<St
             );
             state.set_staged_text(s.clone()).await;
             staged = Some(StagedSelection::Text(s));
-        } else if age > std::time::Duration::from_secs(3) && should_probe_external_text(state) {
+        } else if age > std::time::Duration::from_secs(3) {
             if let Some(bytes) = read_clipboard_text_if_present().await {
                 let s = StagedText {
                     bytes: Arc::new(bytes),
@@ -476,8 +506,7 @@ async fn resolve_paste_intent(state: &Arc<SharedState>, pane: &str) -> Option<St
         // copy — the exact symptom this branch is meant to prevent.
         let live_text = match read_wayland_text_if_present().await {
             Some(b) => Some(b),
-            None if should_probe_external_text(state) => read_clipboard_text_if_present().await,
-            None => None,
+            None => read_clipboard_text_if_present().await,
         };
         if let Some(bytes) = live_text {
             if bytes.as_slice() != existing.bytes.as_slice() {
@@ -534,19 +563,44 @@ fn paste_signature(pane: &str, content: &[u8]) -> u64 {
 }
 
 /// Claim the dispatch slot for `(pane, content)`. Returns `false` (deduped)
-/// when an identical signature was accepted inside `PASTE_DEDUP_WINDOW_MS`.
+/// when an identical signature arrived inside `PASTE_DEDUP_WINDOW_MS`.
 /// The whole read-compare-store runs under the mutex so two simultaneous
 /// identical triggers can't both claim.
-fn claim_paste_slot(state: &SharedState, sig: u64) -> bool {
+fn claim_paste_slot(state: &SharedState, sig: u64, window_ms: u64) -> bool {
     let now = now_unix_ms();
     let mut last = state.last_paste.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((last_ms, last_sig)) = *last {
-        if last_sig == sig && is_duplicate_paste(now, last_ms, PASTE_DEDUP_WINDOW_MS) {
-            return false;
+    let (accept, next) = dedup_decide(*last, now, sig, window_ms);
+    *last = next;
+    accept
+}
+
+/// Pure dedup decision, split out of `claim_paste_slot` so the burst
+/// behaviour is unit-testable without building a whole `SharedState`.
+///
+/// The window **slides**: an absorbed duplicate refreshes the timestamp just
+/// like an accepted paste does. That is the fix for the observed double-image
+/// paste. The old code anchored the window at the last *accepted* paste and
+/// left the slot untouched when it absorbed one, so a burst of presses spread
+/// wider than the window pasted twice. Measured on this box (journal,
+/// 09:55:51.9 / :54.2 / :55.5, identical 236 KB screenshot into pane %5):
+/// press 1 pasted, press 2 was absorbed at +2.31 s, press 3 landed at +3.58 s
+/// — past the 2.5 s anchor — and pasted the *same* image a second time.
+/// Sliding the window means the run collapses to one paste as long as no gap
+/// inside it exceeds the window, which is exactly the "I pressed Ctrl+V a few
+/// times because it felt slow" case. Pasting the same bytes into the same pane
+/// on purpose still works; it just needs `PASTE_DEDUP_WINDOW_MS` of quiet.
+fn dedup_decide(
+    prev: Option<(u64, u64)>,
+    now_ms: u64,
+    sig: u64,
+    window_ms: u64,
+) -> (bool, Option<(u64, u64)>) {
+    if let Some((last_ms, last_sig)) = prev {
+        if last_sig == sig && is_duplicate_paste(now_ms, last_ms, window_ms) {
+            return (false, Some((now_ms, sig)));
         }
     }
-    *last = Some((now, sig));
-    true
+    (true, Some((now_ms, sig)))
 }
 
 fn is_duplicate_paste(now_ms: u64, last_ms: u64, window_ms: u64) -> bool {
@@ -556,13 +610,6 @@ fn is_duplicate_paste(now_ms: u64, last_ms: u64, window_ms: u64) -> bool {
 fn should_scan_screenshots(state: &SharedState) -> bool {
     throttle_ms(
         &state.last_screenshot_scan_ms,
-        crate::tmux::HOT_PATH_PROBE_THROTTLE_MS,
-    )
-}
-
-fn should_probe_external_text(state: &SharedState) -> bool {
-    throttle_ms(
-        &state.last_external_text_probe_ms,
         crate::tmux::HOT_PATH_PROBE_THROTTLE_MS,
     )
 }
@@ -1088,9 +1135,100 @@ mod tests {
         // through.
         assert!(is_duplicate_paste(1_900, 1_000, PASTE_DEDUP_WINDOW_MS));
         assert!(is_duplicate_paste(2_800, 1_000, PASTE_DEDUP_WINDOW_MS)); // 1.8s gap
-        // A repeat at exactly the window edge or beyond is a fresh paste.
+                                                                          // A repeat at exactly the window edge or beyond is a fresh paste.
         assert!(!is_duplicate_paste(3_500, 1_000, PASTE_DEDUP_WINDOW_MS));
         assert!(!is_duplicate_paste(3_501, 1_000, PASTE_DEDUP_WINDOW_MS));
+    }
+
+    /// Replay a run of triggers through the dedup slot, returning how many
+    /// were accepted (i.e. how many pastes the user actually sees).
+    ///
+    /// Offsets are relative to a nonzero epoch base: `is_duplicate_paste`
+    /// treats `last_ms == 0` as the "never pasted" sentinel, and real
+    /// timestamps are unix-epoch ms, so a run must not start at 0.
+    fn replay_window(sig: u64, offsets_ms: &[u64], window_ms: u64) -> usize {
+        const BASE_MS: u64 = 1_774_000_000_000;
+        let mut slot: Option<(u64, u64)> = None;
+        let mut accepted = 0;
+        for &t in offsets_ms {
+            let (ok, next) = dedup_decide(slot, BASE_MS + t, sig, window_ms);
+            slot = next;
+            if ok {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
+    fn replay(sig: u64, offsets_ms: &[u64]) -> usize {
+        replay_window(sig, offsets_ms, PASTE_DEDUP_WINDOW_MS)
+    }
+
+    #[test]
+    fn burst_of_identical_triggers_collapses_to_one_paste() {
+        // The measured double-image-paste, replayed from the daemon journal:
+        // three triggers for the SAME 236 KB screenshot into pane %5 at
+        // 09:55:51.933 / :54.239 / :55.510. Press 2 lands at +2306 ms (inside
+        // the window, absorbed); press 3 at +3577 ms is past the 2500 ms
+        // window *measured from press 1* — which is how the old anchored
+        // window let it through and pasted the image twice. With a sliding
+        // window press 3 is only 1271 ms after press 2, so it is absorbed too.
+        assert_eq!(replay(0xABCD, &[0, 2306, 3577]), 1);
+    }
+
+    #[test]
+    fn long_impatient_burst_still_pastes_once() {
+        // Ctrl+V held/mashed for ~4.5 s: every gap is under the window, so
+        // the whole run is one paste no matter how long it goes on.
+        assert_eq!(replay(0xABCD, &[0, 800, 1600, 2400, 3200, 4000, 4500]), 1);
+    }
+
+    #[test]
+    fn deliberate_repaste_after_quiet_is_allowed() {
+        // The window sliding must not make the same content un-pasteable
+        // forever: once the user stops pressing for a full window, an
+        // intentional repeat of the same bytes goes through.
+        assert_eq!(replay(0xABCD, &[0, 2306, 3577, 6100]), 2);
+    }
+
+    #[test]
+    fn image_window_absorbs_a_human_cadence_re_press() {
+        // The text window alone is not enough for images. Replaying the burst
+        // against the live daemon put press 2 at +2540 ms — 40 ms past the
+        // 2500 ms text window — so the same screenshot was attached twice even
+        // with the window sliding. The image window must absorb that, and a
+        // slower mash (~3 s between presses) too.
+        assert_eq!(
+            replay_window(0xABCD, &[0, 2540, 4400], PASTE_DEDUP_WINDOW_IMAGE_MS),
+            1
+        );
+        assert_eq!(
+            replay_window(0xABCD, &[0, 3000, 6000, 9000], PASTE_DEDUP_WINDOW_IMAGE_MS),
+            1
+        );
+        // The same run under the text window pastes TWICE — press 2 escapes at
+        // +2540 ms and press 3 is then absorbed relative to it. That second
+        // paste is the user-visible double, and it is exactly why images get
+        // their own, wider window.
+        assert_eq!(replay(0xABCD, &[0, 2540, 4400]), 2);
+    }
+
+    #[test]
+    fn image_repaste_still_possible_after_quiet() {
+        // Widening must not make a screenshot un-re-pasteable, just delayed.
+        assert_eq!(
+            replay_window(0xABCD, &[0, 2540, 8000], PASTE_DEDUP_WINDOW_IMAGE_MS),
+            2
+        );
+    }
+
+    #[test]
+    fn distinct_content_is_never_deduped() {
+        // A different signature always claims, even back-to-back — dedup is
+        // keyed on content, so a real second paste is never swallowed.
+        let (ok1, slot) = dedup_decide(None, 1_000, 0xAAAA, PASTE_DEDUP_WINDOW_MS);
+        let (ok2, _) = dedup_decide(slot, 1_010, 0xBBBB, PASTE_DEDUP_WINDOW_MS);
+        assert!(ok1 && ok2);
     }
 
     #[test]

@@ -179,6 +179,25 @@ fn run(state: Arc<SharedState>) -> Result<()> {
                         debug!(revision, "X11: claimed CLIPBOARD ownership");
                     }
                 }
+                // ─── We NEVER voluntarily release CLIPBOARD ───────────────
+                // A timed `set_selection_owner(NONE)` was tried here as a way
+                // to stop a staged screenshot from shadowing the user's text
+                // clipboard. It is not survivable: GNOME/Mutter ships no
+                // clipboard *manager*, so when the last owner disappears the
+                // selection has no owner at all and the system clipboard goes
+                // EMPTY — for text as much as for images. Measured on this box:
+                // stage 22 bytes of text, wait 8 s, and `xclip -o` returns
+                // "target STRING not available" / `wl-paste` returns "Nothing
+                // is copied". Symptom the user hit: copy something, tab over to
+                // a browser (Facebook), Ctrl+V, and paste an empty string.
+                //
+                // The correct X11 lifecycle is to hold the selection until
+                // another client takes it, which arrives as SelectionClear and
+                // needs no action from us. Both text-override paths already
+                // work without releasing: an XWayland copy claims CLIPBOARD
+                // directly (→ SelectionClear), and a native-Wayland copy is
+                // picked up by `read_wayland_text_if_present`, which
+                // `resolve_paste_intent` probes BEFORE the X11 reader.
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
@@ -341,6 +360,17 @@ fn serve_target(
             || target == atoms.text_plain
             || target == atoms.text_plain_utf8
         {
+            // Never serve a zero-length text selection. Writing an empty
+            // property is a *successful* conversion as far as the requestor is
+            // concerned, so it pastes an empty string rather than leaving the
+            // target untouched. Every staging path already rejects empty
+            // (`handle_stage_text`, `read_clipboard_text_if_present`,
+            // `read_wayland_text_if_present`); this is the outgoing-direction
+            // last gate, mirroring `looks_like_text` on the incoming one.
+            if txt.bytes.is_empty() {
+                warn!("X11: refusing to serve an empty text selection");
+                return Ok(false);
+            }
             change_property_chunked(conn, requestor, property, target, &txt.bytes)?;
             return Ok(true);
         }
@@ -359,27 +389,53 @@ fn serve_target(
         let atoms_payload = reply
             .value32()
             .ok_or_else(|| anyhow::anyhow!("MULTIPLE property had wrong format"))?;
-        let pairs: Vec<u32> = atoms_payload.collect();
-        let mut any_ok = false;
-        for chunk in pairs.chunks(2) {
+        let mut pairs: Vec<u32> = atoms_payload.collect();
+        let mut refused_any = false;
+        for chunk in pairs.chunks_mut(2) {
             if chunk.len() != 2 {
                 continue;
             }
             let sub_target = chunk[0];
             let sub_property = chunk[1];
-            let ok = serve_target(
-                conn,
-                _window,
-                atoms,
-                staged,
-                requestor,
-                sub_property,
-                sub_target,
-            )
-            .unwrap_or(false);
-            any_ok = any_ok || ok;
+            // ICCCM forbids nesting MULTIPLE inside MULTIPLE; honouring it
+            // would recurse until the stack blows. Treat it as refused.
+            let ok = sub_target != atoms.multiple
+                && serve_target(
+                    conn,
+                    _window,
+                    atoms,
+                    staged,
+                    requestor,
+                    sub_property,
+                    sub_target,
+                )
+                .unwrap_or(false);
+            if !ok {
+                // ICCCM 2.6.2: "If the owner fails to convert the target named
+                // by an atom in the ATOM_PAIR, it should replace that atom in
+                // the property with None." We used to skip this, leaving the
+                // pair intact — so a requestor that asked for text while we
+                // held an image was told the conversion SUCCEEDED, read the
+                // property we never wrote, and pasted an EMPTY string. GTK and
+                // Firefox both request via MULTIPLE, which is how this reached
+                // a browser compose box.
+                chunk[1] = x11rb::NONE;
+                refused_any = true;
+            }
         }
-        return Ok(any_ok);
+        if refused_any {
+            conn.change_property32(
+                PropMode::REPLACE,
+                requestor,
+                property,
+                atoms.atom_pair,
+                &pairs,
+            )?;
+        }
+        // The MULTIPLE conversion itself succeeded — we processed the list and
+        // reported per-target outcomes inside it. Per-target failures are
+        // signalled by the None atoms above, not by refusing the whole request.
+        return Ok(true);
     }
     debug!(target, "X11: refusing unknown target");
     Ok(false)
